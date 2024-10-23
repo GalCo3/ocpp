@@ -250,31 +250,111 @@ class ChargePoint:
         """
         Route a message received from a CP.
 
-        If the message is a of type Call the corresponding hooks are executed.
-        If the message is of type CallResult or CallError the message is passed
-        to the call() function via the response_queue.
+        If the message is of type Call, execute the corresponding hooks.
+        If the message is of type CallResult or CallError, pass the message to the call() function via the response_queue.
         """
         try:
-            msg = unpack(raw_msg)
+            msg = unpack(raw_msg)  # Unpack the message, but keep the original raw_msg
         except OCPPError as e:
-            self.logger.exception(
+            LOGGER.exception(
                 "Unable to parse message: '%s', it doesn't seem "
-                "to be valid OCPP: %s",
-                raw_msg,
-                e,
+                "to be valid OCPP: %s", raw_msg, e
             )
             return
 
+        # Log the raw message (optional)
+        LOGGER.info(f"Original raw WebSocket message: {raw_msg}")
+
         if msg.message_type_id == MessageType.Call:
             try:
-                await self._handle_call(msg)
+                # Pass the original message (raw_msg) along with the parsed message (msg)
+                await self._handle_call_with_raw_msg(msg, raw_msg)
             except OCPPError as error:
-                self.logger.exception("Error while handling request '%s'", msg)
+                LOGGER.exception("Error while handling request '%s'", msg)
                 response = msg.create_call_error(error).to_json()
                 await self._send(response)
 
         elif msg.message_type_id in [MessageType.CallResult, MessageType.CallError]:
             self._response_queue.put_nowait(msg)
+
+    # New method to handle calls and pass the original message
+    async def _handle_call_with_raw_msg(self, msg, raw_msg):
+        """
+        Execute all hooks installed for based on the Action of the message,
+        and pass the original message (raw_msg) to the handler.
+        """
+        try:
+            handlers = self.route_map[msg.action]
+        except KeyError:
+            _raise_key_error(msg.action, self._ocpp_version)
+            return
+
+        if not handlers.get("_skip_schema_validation", False):
+            validate_payload(msg, self._ocpp_version)
+
+        # OCPP uses camelCase for the keys in the payload. It's more pythonic
+        # to use snake_case for keyword arguments. Therefore the keys must be
+        # 'translated'. Some examples:
+        #
+        # * chargePointVendor becomes charge_point_vendor
+        # * firmwareVersion becomes firmware_version
+        snake_case_payload = camel_to_snake_case(msg.payload)
+
+        try:
+            handler = handlers["_on_action"]
+        except KeyError:
+            _raise_key_error(msg.action, self._ocpp_version)
+
+        handler_signature = inspect.signature(handler)
+        call_unique_id_required = "call_unique_id" in handler_signature.parameters
+
+        try:
+            # call_unique_id should be passed as kwarg only if it is defined explicitly
+            # in the handler signature. Adding `og_msg` here as well.
+            if call_unique_id_required:
+                response = handler(**snake_case_payload, call_unique_id=msg.unique_id, og_msg=raw_msg)
+            else:
+                response = handler(**snake_case_payload, og_msg=raw_msg)  # Add `og_msg` here
+            if inspect.isawaitable(response):
+                response = await response
+        except Exception as e:
+            LOGGER.exception("Error while handling request '%s'", msg)
+            response = msg.create_call_error(e).to_json()
+            await self._send(response)
+            return
+
+        temp_response_payload = serialize_as_dict(response)
+        response_payload = remove_nones(temp_response_payload)
+
+        # The response payload must be 'translated' from snake_case to
+        # camelCase.
+        camel_case_payload = snake_to_camel_case(response_payload)
+
+        response = msg.create_call_result(camel_case_payload)
+
+        if not handlers.get("_skip_schema_validation", False):
+            validate_payload(response, self._ocpp_version)
+
+        await self._send(response.to_json())
+
+        try:
+            handler = handlers["_after_action"]
+            handler_signature = inspect.signature(handler)
+            call_unique_id_required = "call_unique_id" in handler_signature.parameters
+
+            # Add `og_msg` here as well when calling the after handler
+            if call_unique_id_required:
+                response = handler(**snake_case_payload, call_unique_id=msg.unique_id, og_msg=raw_msg)
+            else:
+                response = handler(**snake_case_payload, og_msg=raw_msg)  # Add `og_msg` here
+
+            if inspect.isawaitable(response):
+                asyncio.ensure_future(response)
+        except KeyError:
+            # '_on_after' hooks are not required. Therefore, ignore exception
+            # when no '_on_after' hook is installed.
+            pass
+        return response
 
     async def _handle_call(self, msg):
         """
